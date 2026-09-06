@@ -35,30 +35,6 @@ DEFAULT_UUID = "b249d7ad-3331-4fc3-b1b4-d412fe0d4414"
 _started = False
 _lock = threading.Lock()
 
-def ensure_binaries():
-    xray_bin = "/usr/local/bin/xray" if os.path.exists("/usr/local/bin/xray") else "/tmp/xray"
-    if not os.path.exists(xray_bin):
-        try:
-            urllib.request.urlretrieve("https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip", "/tmp/xray.zip")
-            with zipfile.ZipFile("/tmp/xray.zip", 'r') as zip_ref:
-                zip_ref.extractall("/tmp/xray_files")
-            os.rename("/tmp/xray_files/xray", "/tmp/xray")
-            os.chmod("/tmp/xray", 0o775)
-            xray_bin = "/tmp/xray"
-        except Exception as e:
-            print(f"Xray download fallback failed: {e}")
-
-    cf_bin = "/usr/local/bin/cloudflared" if os.path.exists("/usr/local/bin/cloudflared") else "/tmp/cloudflared"
-    if not os.path.exists(cf_bin):
-        try:
-            urllib.request.urlretrieve("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "/tmp/cloudflared")
-            os.chmod("/tmp/cloudflared", 0o775)
-            cf_bin = "/tmp/cloudflared"
-        except Exception as e:
-            print(f"Cloudflared download fallback failed: {e}")
-
-    return xray_bin, cf_bin
-
 def launch_background_daemons():
     global _started
     with _lock:
@@ -66,16 +42,15 @@ def launch_background_daemons():
             return
         _started = True
 
-    xray_bin, cf_bin = ensure_binaries()
     uuid = os.environ.get('UUID') or DEFAULT_UUID
     cf_token = os.environ.get('CF_TOKEN') or DEFAULT_CF_TOKEN
     nz_server = os.environ.get('NEZHA_SERVER', '')
     nz_port = os.environ.get('NEZHA_PORT', '')
     nz_key = os.environ.get('NEZHA_KEY', '')
 
-    # 1. 启动 Xray 核心 (同时提供本地 10000 转发与 8080 WS)
+    # 1. 启动 Xray 核心 (同时提供 10000 转发与 8080 WS 隧道)
     xray_config = {
-        "log": {"loglevel": "none"},
+        "log": {"loglevel": "warning"},
         "inbounds": [
             {
                 "port": 10000,
@@ -97,11 +72,12 @@ def launch_background_daemons():
     with open("/tmp/xray.json", "w") as f:
         json.dump(xray_config, f)
 
-    subprocess.Popen(f"{xray_bin} run -c /tmp/xray.json > /tmp/xray.log 2>&1", shell=True)
+    subprocess.Popen("/usr/local/bin/xray run -c /tmp/xray.json > /tmp/xray.log 2>&1", shell=True)
 
-    # 2. 启动 Cloudflare 隧道
+    # 2. 启动 Cloudflare 隧道 (强制使用 HTTP2 协议解决握手卡死)
     if cf_token:
-        subprocess.Popen(f"{cf_bin} tunnel --no-autoupdate run --token {cf_token} > /tmp/cloudflared.log 2>&1", shell=True)
+        cmd = f"/usr/local/bin/cloudflared tunnel --protocol http2 --no-autoupdate run --token {cf_token} > /tmp/cloudflared.log 2>&1"
+        subprocess.Popen(cmd, shell=True)
 
     # 3. 启动哪吒探针
     if nz_server and nz_key:
@@ -118,6 +94,9 @@ def launch_background_daemons():
             with open("/tmp/nezha.yaml", "w") as f:
                 f.write(cfg)
             subprocess.Popen(f"nohup {agent_bin} -c /tmp/nezha.yaml > /tmp/nezha.log 2>&1 &", shell=True)
+
+# 强制在容器初始化时启动后台服务
+launch_background_daemons()
 
 # ========== 2. HTTP 页面与健康检查 ==========
 @web_app.on_event("startup")
@@ -143,7 +122,7 @@ def status():
     def read_log(p):
         if os.path.exists(p):
             with open(p, "r", errors="ignore") as f:
-                return f.read()[-600:]
+                return f.read()[-1000:]
         return "Not found"
 
     return {
@@ -154,7 +133,7 @@ def status():
         "cloudflared_log": read_log("/tmp/cloudflared.log"),
     }
 
-# ========== 3. WebSocket 直连转发桥（实现 Modal 原生域名直接做节点） ==========
+# ========== 3. WebSocket 直连中继桥 ==========
 @web_app.websocket("/")
 @web_app.websocket("/ws")
 async def ws_proxy(websocket: WebSocket):
