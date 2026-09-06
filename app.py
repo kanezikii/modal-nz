@@ -8,7 +8,7 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 import modal
 
-# ========== 1. 预构建镜像（固定预装 Xray 与 Cloudflared） ==========
+# ========== 1. 预构建镜像 ==========
 image = (
     modal.Image.debian_slim()
     .apt_install("curl", "unzip", "ca-certificates", "procps")
@@ -43,7 +43,7 @@ def start_all_services():
     nz_port = os.environ.get('NEZHA_PORT', '')
     nz_key = os.environ.get('NEZHA_KEY', '')
 
-    # 1. 启动 Xray 核心 (10000 端口对接直连中继，8080 端口对接 CF 隧道)
+    # 1. 启动 Xray 核心 (同时监听 TCP 10000 与 WS 8080)
     xray_config = {
         "log": {"loglevel": "none"},
         "inbounds": [
@@ -88,6 +88,7 @@ def start_all_services():
                 f.write(cfg)
             subprocess.Popen(f"nohup {agent_bin} -c /tmp/nezha.yaml > /tmp/nezha.log 2>&1 &", shell=True)
 
+# ========== 2. HTTP 与 诊断路由 ==========
 @web_app.on_event("startup")
 async def on_startup():
     start_all_services()
@@ -111,7 +112,7 @@ async def status():
     def get_log(path):
         if os.path.exists(path):
             with open(path, "r", errors="ignore") as f:
-                return f.read()[-600:]
+                return f.read()[-500:]
         return "Not generated"
 
     return {
@@ -122,7 +123,7 @@ async def status():
         "cloudflared_log": get_log("/tmp/cloudflared.log"),
     }
 
-# ========== 2. WebSocket 直连中继桥 ==========
+# ========== 3. WebSocket 直连中继桥 ==========
 @web_app.websocket("/")
 @web_app.websocket("/ws")
 async def websocket_relay(websocket: WebSocket):
@@ -173,7 +174,7 @@ async def websocket_relay(websocket: WebSocket):
 
     await asyncio.gather(ws_to_tcp(), tcp_to_ws(), return_exceptions=True)
 
-# ========== 3. Modal 函数入口 ==========
+# ========== 4. Modal 容器入口（保证每次加载都触发启动） ==========
 @app.function(
     secrets=[modal.Secret.from_name("nezha-secrets")],
     scaledown_window=300,
@@ -181,4 +182,5 @@ async def websocket_relay(websocket: WebSocket):
 )
 @modal.asgi_app()
 def fastapi_app():
+    start_all_services()
     return web_app
