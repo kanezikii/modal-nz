@@ -277,10 +277,11 @@ jobs:
             NEZHA_PORT="$RESOLVED_NEZHA_PORT" \
             NEZHA_KEY="$RESOLVED_NEZHA_KEY" \
             UUID="${RESOLVED_UUID:-b249d7ad-3331-4fc3-b1b4-d412fe0d4414}" \
+            CF_TOKEN="${{ secrets.CF_TOKEN }}" \
             AUTO_ACCESS="${{ secrets.AUTO_ACCESS || 'true' }}" \
             KEEPALIVE_INTERVAL="${{ secrets.KEEPALIVE_INTERVAL || '120' }}" \
             DEPLOY_REGION="$DEPLOY_REGION"
-          echo "✅ Modal密钥创建成功（区域: $DEPLOY_REGION - $REGION_DESC）"
+          echo "✅ Modal密钥创建成功"
 
       - name: 部署到Modal
         id: deploy
