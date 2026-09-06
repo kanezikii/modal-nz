@@ -10,19 +10,18 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import modal
 
-# ========== 区域智能映射函数 ==========
-def sanitize_modal_region(region_str: str) -> str:
-    if not region_str:
+# ========== 1. 区域代码转换（解决 us-west2 等无法识别的问题）==========
+def get_modal_region(raw_region: str) -> str:
+    if not raw_region:
         return "us-east"
-    r = region_str.lower().strip()
+    r = raw_region.lower().strip()
     valid_regions = {
         "us-east", "us-west", "eu-west", "eu-north",
         "ap-northeast", "ap-southeast", "ap-south", "ap-melbourne"
     }
     if r in valid_regions:
         return r
-    # 关键字归一化映射
-    if any(k in r for k in ["west", "sanjose", "los_angeles", "california", "oregon", "lasvegas"]):
+    if any(k in r for k in ["west", "sanjose", "california", "oregon", "lasvegas", "phoenix"]):
         return "us-west"
     if any(k in r for k in ["northeast", "tokyo", "seoul", "japan", "korea", "jp", "osaka", "taiwan"]):
         return "ap-northeast"
@@ -38,9 +37,9 @@ def sanitize_modal_region(region_str: str) -> str:
         return "eu-west"
     return "us-east"
 
-DEPLOY_REGION = sanitize_modal_region(os.environ.get('DEPLOY_REGION', 'us-east'))
+DEPLOY_REGION = get_modal_region(os.environ.get('DEPLOY_REGION', 'us-east'))
 
-# ========== Modal 镜像配置 ==========
+# ========== 2. Modal 镜像配置 ==========
 image = modal.Image.debian_slim().pip_install(
     "fastapi==0.115.12",
     "requests",
@@ -51,15 +50,15 @@ image = modal.Image.debian_slim().pip_install(
 app = modal.App("app", image=image)
 web_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
-_services_started = False
-_services_lock = threading.Lock()
+_started = False
+_lock = threading.Lock()
 
 def get_arch():
     arch = platform.machine().lower()
     return 'arm' if 'arm' in arch or 'aarch64' in arch else 'amd'
 
-# ========== 1. Xray 节点核心 (监听 8080) ==========
-def run_xray(uuid):
+# ========== 3. Xray 代理服务 (8080 端口) ==========
+def start_xray(uuid):
     arch = get_arch()
     xray_arch = "arm64-v8a" if arch == 'arm' else "64"
     xray_bin = "/tmp/xray"
@@ -74,7 +73,7 @@ def run_xray(uuid):
             os.rename("/tmp/xray_files/xray", xray_bin)
             os.chmod(xray_bin, 0o775)
         except Exception as e:
-            print(f"Xray download failed: {e}")
+            print(f"Xray download error: {e}")
             return
 
     config = {
@@ -95,17 +94,17 @@ def run_xray(uuid):
         "outbounds": [{"protocol": "freedom"}]
     }
     
-    config_path = "/tmp/xray_config.json"
-    with open(config_path, "w") as f:
+    cfg_path = "/tmp/xray_config.json"
+    with open(cfg_path, "w") as f:
         json.dump(config, f)
         
-    subprocess.Popen(f"{xray_bin} run -c {config_path} >/dev/null 2>&1 &", shell=True)
-    print("✅ Xray service started on port 8080")
+    subprocess.Popen(f"{xray_bin} run -c {cfg_path} >/dev/null 2>&1 &", shell=True)
+    print("Xray started on port 8080")
 
-# ========== 2. Cloudflare 隧道 ==========
-def run_cloudflared(token):
+# ========== 4. Cloudflare 隧道服务 ==========
+def start_cloudflared(token):
     if not token:
-        print("⚠️ CF_TOKEN is empty, skipping tunnel.")
+        print("CF_TOKEN is empty, skipping tunnel.")
         return
     arch = get_arch()
     cf_arch = "arm64" if arch == 'arm' else "amd64"
@@ -117,15 +116,15 @@ def run_cloudflared(token):
             urllib.request.urlretrieve(url, cf_bin)
             os.chmod(cf_bin, 0o775)
         except Exception as e:
-            print(f"Cloudflared download failed: {e}")
+            print(f"Cloudflared download error: {e}")
             return
             
     cmd = f"{cf_bin} tunnel --no-autoupdate run --token {token} >/dev/null 2>&1 &"
     subprocess.Popen(cmd, shell=True)
-    print("✅ Cloudflared tunnel connected")
+    print("Cloudflared tunnel started")
 
-# ========== 3. 哪吒探针 ==========
-def run_nezha(server, port, key, uuid):
+# ========== 5. 哪吒探针服务 ==========
+def start_nezha(server, port, key, uuid):
     if not server or not key:
         return
     arch = get_arch()
@@ -136,7 +135,7 @@ def run_nezha(server, port, key, uuid):
         urllib.request.urlretrieve(url, agent_bin)
         os.chmod(agent_bin, 0o775)
     except Exception as e:
-        print(f"Nezha download failed: {e}")
+        print(f"Nezha download error: {e}")
         return
 
     if port:
@@ -151,15 +150,14 @@ def run_nezha(server, port, key, uuid):
         cmd = f"nohup {agent_bin} -c /tmp/nezha.yaml >/dev/null 2>&1 &"
         
     subprocess.Popen(cmd, shell=True)
-    print("✅ Nezha agent started")
+    print("Nezha agent started")
 
-# ========== 服务启动控制 ==========
-def start_all_services():
-    global _services_started
-    with _services_lock:
-        if _services_started:
+def run_all():
+    global _started
+    with _lock:
+        if _started:
             return
-        _services_started = True
+        _started = True
 
     uuid = os.environ.get('UUID', 'b249d7ad-3331-4fc3-b1b4-d412fe0d4414')
     cf_token = os.environ.get('CF_TOKEN', '')
@@ -167,23 +165,23 @@ def start_all_services():
     nz_port = os.environ.get('NEZHA_PORT', '')
     nz_key = os.environ.get('NEZHA_KEY', '')
 
-    threading.Thread(target=run_xray, args=(uuid,), daemon=True).start()
-    threading.Thread(target=run_cloudflared, args=(cf_token,), daemon=True).start()
-    threading.Thread(target=run_nezha, args=(nz_server, nz_port, nz_key, uuid), daemon=True).start()
+    threading.Thread(target=start_xray, args=(uuid,), daemon=True).start()
+    threading.Thread(target=start_cloudflared, args=(cf_token,), daemon=True).start()
+    threading.Thread(target=start_nezha, args=(nz_server, nz_port, nz_key, uuid), daemon=True).start()
 
 @web_app.on_event("startup")
-async def startup_event():
-    start_all_services()
+async def on_startup():
+    run_all()
 
 @web_app.get("/")
-async def root():
-    return HTMLResponse("<html><body><h2>Cloud Platform Operational</h2></body></html>")
+async def index():
+    return HTMLResponse("<html><body><h2>Operational</h2></body></html>")
 
 @web_app.get("/health")
 async def health():
     return {"status": "healthy", "region": DEPLOY_REGION, "timestamp": time.time()}
 
-# ========== Modal 函数注册 ==========
+# ========== 6. Modal 入口 ==========
 @app.function(
     secrets=[modal.Secret.from_name("nezha-secrets")],
     scaledown_window=300,
