@@ -129,7 +129,7 @@ def index():
     launch_background_daemons()
     return HTMLResponse("<html><body><h2>Cloud Proxy Node Operational</h2></body></html>")
 
-@web_app.get("/health")
+@web_app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     launch_background_daemons()
     return {"status": "healthy", "time": time.time()}
