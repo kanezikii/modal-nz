@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import modal
 
-# ========== 1. 镜像与应用定义（固定美区） ==========
+# ========== 1. 镜像与应用定义 ==========
 image = modal.Image.debian_slim().pip_install(
     "fastapi==0.115.12",
     "requests",
@@ -123,7 +123,7 @@ def start_nezha(server, port, key, uuid):
     subprocess.Popen(cmd, shell=True)
     print("✅ Nezha agent connected")
 
-# ========== 5. 启动控制 ==========
+# ========== 5. 启动总控 ==========
 def run_all():
     global _started
     with _lock:
@@ -153,12 +153,11 @@ async def index():
 async def health():
     return {"status": "healthy", "region": "us-east", "timestamp": time.time()}
 
-# ========== 6. Modal 入口（固定美东 us-east） ==========
+# ========== 6. Modal 入口（固定美东，移除废弃参数） ==========
 @app.function(
     secrets=[modal.Secret.from_name("nezha-secrets")],
     scaledown_window=300,
     region="us-east",
-    allow_concurrent_inputs=100,
 )
 @modal.asgi_app()
 def fastapi_app():
