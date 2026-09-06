@@ -124,7 +124,7 @@ launch_background_daemons()
 def on_startup():
     launch_background_daemons()
 
-@web_app.get("/")
+@web_app.api_route("/", methods=["GET", "HEAD"])
 def index():
     launch_background_daemons()
     return HTMLResponse("<html><body><h2>Cloud Proxy Node Operational</h2></body></html>")
