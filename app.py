@@ -10,36 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import modal
 
-# ========== 1. 区域代码转换（解决 us-west2 等无法识别的问题）==========
-def get_modal_region(raw_region: str) -> str:
-    if not raw_region:
-        return "us-east"
-    r = raw_region.lower().strip()
-    valid_regions = {
-        "us-east", "us-west", "eu-west", "eu-north",
-        "ap-northeast", "ap-southeast", "ap-south", "ap-melbourne"
-    }
-    if r in valid_regions:
-        return r
-    if any(k in r for k in ["west", "sanjose", "california", "oregon", "lasvegas", "phoenix"]):
-        return "us-west"
-    if any(k in r for k in ["northeast", "tokyo", "seoul", "japan", "korea", "jp", "osaka", "taiwan"]):
-        return "ap-northeast"
-    if any(k in r for k in ["southeast", "singapore", "jakarta", "malaysia"]):
-        return "ap-southeast"
-    if any(k in r for k in ["south", "mumbai", "india", "delhi", "chennai", "pune"]):
-        return "ap-south"
-    if any(k in r for k in ["melbourne", "sydney", "australia", "au"]):
-        return "ap-melbourne"
-    if any(k in r for k in ["north", "stockholm", "sweden", "norway", "oslo"]):
-        return "eu-north"
-    if any(k in r for k in ["eu", "europe", "frankfurt", "paris", "london", "uk", "ireland", "spain", "italy", "poland"]):
-        return "eu-west"
-    return "us-east"
-
-DEPLOY_REGION = get_modal_region(os.environ.get('DEPLOY_REGION', 'us-east'))
-
-# ========== 2. Modal 镜像配置 ==========
+# ========== 1. 镜像与应用定义（固定美区） ==========
 image = modal.Image.debian_slim().pip_install(
     "fastapi==0.115.12",
     "requests",
@@ -57,7 +28,7 @@ def get_arch():
     arch = platform.machine().lower()
     return 'arm' if 'arm' in arch or 'aarch64' in arch else 'amd'
 
-# ========== 3. Xray 代理服务 (8080 端口) ==========
+# ========== 2. Xray 代理节点服务 (监听 8080) ==========
 def start_xray(uuid):
     arch = get_arch()
     xray_arch = "arm64-v8a" if arch == 'arm' else "64"
@@ -73,7 +44,7 @@ def start_xray(uuid):
             os.rename("/tmp/xray_files/xray", xray_bin)
             os.chmod(xray_bin, 0o775)
         except Exception as e:
-            print(f"Xray download error: {e}")
+            print(f"Xray download failed: {e}")
             return
 
     config = {
@@ -99,12 +70,12 @@ def start_xray(uuid):
         json.dump(config, f)
         
     subprocess.Popen(f"{xray_bin} run -c {cfg_path} >/dev/null 2>&1 &", shell=True)
-    print("Xray started on port 8080")
+    print("✅ Xray service running on port 8080")
 
-# ========== 4. Cloudflare 隧道服务 ==========
+# ========== 3. Cloudflare 隧道服务 ==========
 def start_cloudflared(token):
     if not token:
-        print("CF_TOKEN is empty, skipping tunnel.")
+        print("⚠️ CF_TOKEN is empty, skipping tunnel.")
         return
     arch = get_arch()
     cf_arch = "arm64" if arch == 'arm' else "amd64"
@@ -116,14 +87,14 @@ def start_cloudflared(token):
             urllib.request.urlretrieve(url, cf_bin)
             os.chmod(cf_bin, 0o775)
         except Exception as e:
-            print(f"Cloudflared download error: {e}")
+            print(f"Cloudflared download failed: {e}")
             return
             
     cmd = f"{cf_bin} tunnel --no-autoupdate run --token {token} >/dev/null 2>&1 &"
     subprocess.Popen(cmd, shell=True)
-    print("Cloudflared tunnel started")
+    print("✅ Cloudflared tunnel connected")
 
-# ========== 5. 哪吒探针服务 ==========
+# ========== 4. 哪吒探针服务 ==========
 def start_nezha(server, port, key, uuid):
     if not server or not key:
         return
@@ -135,7 +106,7 @@ def start_nezha(server, port, key, uuid):
         urllib.request.urlretrieve(url, agent_bin)
         os.chmod(agent_bin, 0o775)
     except Exception as e:
-        print(f"Nezha download error: {e}")
+        print(f"Nezha download failed: {e}")
         return
 
     if port:
@@ -150,8 +121,9 @@ def start_nezha(server, port, key, uuid):
         cmd = f"nohup {agent_bin} -c /tmp/nezha.yaml >/dev/null 2>&1 &"
         
     subprocess.Popen(cmd, shell=True)
-    print("Nezha agent started")
+    print("✅ Nezha agent connected")
 
+# ========== 5. 启动控制 ==========
 def run_all():
     global _started
     with _lock:
@@ -175,17 +147,17 @@ async def on_startup():
 
 @web_app.get("/")
 async def index():
-    return HTMLResponse("<html><body><h2>Operational</h2></body></html>")
+    return HTMLResponse("<html><body><h2>Cloud Node Operational</h2></body></html>")
 
 @web_app.get("/health")
 async def health():
-    return {"status": "healthy", "region": DEPLOY_REGION, "timestamp": time.time()}
+    return {"status": "healthy", "region": "us-east", "timestamp": time.time()}
 
-# ========== 6. Modal 入口 ==========
+# ========== 6. Modal 入口（固定美东 us-east） ==========
 @app.function(
     secrets=[modal.Secret.from_name("nezha-secrets")],
     scaledown_window=300,
-    region=DEPLOY_REGION,
+    region="us-east",
     allow_concurrent_inputs=100,
 )
 @modal.asgi_app()
