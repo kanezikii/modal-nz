@@ -2,12 +2,15 @@ import os
 import json
 import time
 import subprocess
+import urllib.request
+import zipfile
+import asyncio
 import threading
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 import modal
 
-# ========== 1. 预构建环境 ==========
+# ========== 1. 预构建镜像 ==========
 image = (
     modal.Image.debian_slim()
     .apt_install("curl", "unzip", "ca-certificates", "procps")
@@ -20,19 +23,41 @@ image = (
         "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && "
         "chmod +x /usr/local/bin/cloudflared",
     )
-    .pip_install("fastapi==0.115.12", "requests", "psutil", "uvicorn")
+    .pip_install("fastapi==0.115.12", "requests", "psutil", "uvicorn", "websockets")
 )
 
 app = modal.App("app-node", image=image)
 web_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
-# ========== 2. 后台服务启动逻辑 ==========
-# 若 Secret 传空，则自动启用你的专属保底 Token
 DEFAULT_CF_TOKEN = "eyJhIjoiYTcwNDZjMmMwNzkwZWYwM2E0YzkxM2I0ZTBkODQ5NjUiLCJ0IjoiMmU2NGY3NDgtZmQ1ZC00N2Y2LWEzMTgtMTI0ZjM1YmM2MTAxIiwicyI6Ik5URmhORE0yTkRRdFkyWTROUzAwTTJKbUxUZzJOMll0WVdFM1lqUTNOMlE0Wm1JMyJ9"
 DEFAULT_UUID = "b249d7ad-3331-4fc3-b1b4-d412fe0d4414"
 
 _started = False
 _lock = threading.Lock()
+
+def ensure_binaries():
+    xray_bin = "/usr/local/bin/xray" if os.path.exists("/usr/local/bin/xray") else "/tmp/xray"
+    if not os.path.exists(xray_bin):
+        try:
+            urllib.request.urlretrieve("https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip", "/tmp/xray.zip")
+            with zipfile.ZipFile("/tmp/xray.zip", 'r') as zip_ref:
+                zip_ref.extractall("/tmp/xray_files")
+            os.rename("/tmp/xray_files/xray", "/tmp/xray")
+            os.chmod("/tmp/xray", 0o775)
+            xray_bin = "/tmp/xray"
+        except Exception as e:
+            print(f"Xray download fallback failed: {e}")
+
+    cf_bin = "/usr/local/bin/cloudflared" if os.path.exists("/usr/local/bin/cloudflared") else "/tmp/cloudflared"
+    if not os.path.exists(cf_bin):
+        try:
+            urllib.request.urlretrieve("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "/tmp/cloudflared")
+            os.chmod("/tmp/cloudflared", 0o775)
+            cf_bin = "/tmp/cloudflared"
+        except Exception as e:
+            print(f"Cloudflared download fallback failed: {e}")
+
+    return xray_bin, cf_bin
 
 def launch_background_daemons():
     global _started
@@ -41,46 +66,42 @@ def launch_background_daemons():
             return
         _started = True
 
+    xray_bin, cf_bin = ensure_binaries()
     uuid = os.environ.get('UUID') or DEFAULT_UUID
     cf_token = os.environ.get('CF_TOKEN') or DEFAULT_CF_TOKEN
     nz_server = os.environ.get('NEZHA_SERVER', '')
     nz_port = os.environ.get('NEZHA_PORT', '')
     nz_key = os.environ.get('NEZHA_KEY', '')
 
-    # 1. 启动 Xray 核心 (监听 8080 端口)
+    # 1. 启动 Xray 核心 (同时提供本地 10000 转发与 8080 WS)
     xray_config = {
         "log": {"loglevel": "none"},
-        "inbounds": [{
-            "port": 8080,
-            "listen": "0.0.0.0",
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": uuid, "level": 0}],
-                "decryption": "none"
+        "inbounds": [
+            {
+                "port": 10000,
+                "listen": "127.0.0.1",
+                "protocol": "vless",
+                "settings": {"clients": [{"id": uuid, "level": 0}], "decryption": "none"},
+                "streamSettings": {"network": "tcp"}
             },
-            "streamSettings": {
-                "network": "ws",
-                "wsSettings": {"path": "/"}
+            {
+                "port": 8080,
+                "listen": "0.0.0.0",
+                "protocol": "vless",
+                "settings": {"clients": [{"id": uuid, "level": 0}], "decryption": "none"},
+                "streamSettings": {"network": "ws", "wsSettings": {"path": "/"}}
             }
-        }],
+        ],
         "outbounds": [{"protocol": "freedom"}]
     }
     with open("/tmp/xray.json", "w") as f:
         json.dump(xray_config, f)
 
-    subprocess.Popen(
-        "/usr/local/bin/xray run -c /tmp/xray.json > /tmp/xray.log 2>&1",
-        shell=True,
-        start_new_session=True
-    )
+    subprocess.Popen(f"{xray_bin} run -c /tmp/xray.json > /tmp/xray.log 2>&1", shell=True)
 
-    # 2. 启动 Cloudflare 隧道 (直连 8080)
+    # 2. 启动 Cloudflare 隧道
     if cf_token:
-        subprocess.Popen(
-            f"/usr/local/bin/cloudflared tunnel --no-autoupdate run --token {cf_token} > /tmp/cloudflared.log 2>&1",
-            shell=True,
-            start_new_session=True
-        )
+        subprocess.Popen(f"{cf_bin} tunnel --no-autoupdate run --token {cf_token} > /tmp/cloudflared.log 2>&1", shell=True)
 
     # 3. 启动哪吒探针
     if nz_server and nz_key:
@@ -98,10 +119,7 @@ def launch_background_daemons():
                 f.write(cfg)
             subprocess.Popen(f"nohup {agent_bin} -c /tmp/nezha.yaml > /tmp/nezha.log 2>&1 &", shell=True)
 
-# 容器启动时强制拉起
-launch_background_daemons()
-
-# ========== 3. HTTP 路由 ==========
+# ========== 2. HTTP 页面与健康检查 ==========
 @web_app.on_event("startup")
 def on_startup():
     launch_background_daemons()
@@ -125,16 +143,67 @@ def status():
     def read_log(p):
         if os.path.exists(p):
             with open(p, "r", errors="ignore") as f:
-                return f.read()[-500:]
+                return f.read()[-600:]
         return "Not found"
 
     return {
         "xray_alive": any("xray" in p for p in procs),
         "cloudflared_alive": any("cloudflared" in p for p in procs),
-        "all_processes": procs,
+        "processes": procs,
         "xray_log": read_log("/tmp/xray.log"),
         "cloudflared_log": read_log("/tmp/cloudflared.log"),
     }
+
+# ========== 3. WebSocket 直连转发桥（实现 Modal 原生域名直接做节点） ==========
+@web_app.websocket("/")
+@web_app.websocket("/ws")
+async def ws_proxy(websocket: WebSocket):
+    await websocket.accept()
+    launch_background_daemons()
+
+    reader, writer = None, None
+    for _ in range(20):
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", 10000)
+            break
+        except Exception:
+            await asyncio.sleep(0.1)
+
+    if not reader or not writer:
+        await websocket.close()
+        return
+
+    async def ws_to_tcp():
+        try:
+            while True:
+                data = await websocket.receive_bytes()
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def tcp_to_ws():
+        try:
+            while True:
+                data = await reader.read(4096)
+                if not data:
+                    break
+                await websocket.send_bytes(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+    await asyncio.gather(ws_to_tcp(), tcp_to_ws(), return_exceptions=True)
 
 # ========== 4. Modal 入口 ==========
 @app.function(
