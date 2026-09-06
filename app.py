@@ -2,13 +2,12 @@ import os
 import json
 import time
 import subprocess
-import asyncio
 import threading
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import modal
 
-# ========== 1. 预构建镜像 ==========
+# ========== 1. 预构建环境 ==========
 image = (
     modal.Image.debian_slim()
     .apt_install("curl", "unzip", "ca-certificates", "procps")
@@ -21,63 +20,74 @@ image = (
         "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && "
         "chmod +x /usr/local/bin/cloudflared",
     )
-    .pip_install("fastapi==0.115.12", "requests", "psutil", "uvicorn", "websockets")
+    .pip_install("fastapi==0.115.12", "requests", "psutil", "uvicorn")
 )
 
-app = modal.App("app", image=image)
+app = modal.App("app-node", image=image)
 web_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+# ========== 2. 后台服务启动逻辑 ==========
+# 若 Secret 传空，则自动启用你的专属保底 Token
+DEFAULT_CF_TOKEN = "eyJhIjoiYTcwNDZjMmMwNzkwZWYwM2E0YzkxM2I0ZTBkODQ5NjUiLCJ0IjoiMmU2NGY3NDgtZmQ1ZC00N2Y2LWEzMTgtMTI0ZjM1YmM2MTAxIiwicyI6Ik5URmhORE0yTkRRdFkyWTROUzAwTTJKbUxUZzJOMll0WVdFM1lqUTNOMlE0Wm1JMyJ9"
+DEFAULT_UUID = "b249d7ad-3331-4fc3-b1b4-d412fe0d4414"
 
 _started = False
 _lock = threading.Lock()
 
-def start_all_services():
+def launch_background_daemons():
     global _started
     with _lock:
         if _started:
             return
         _started = True
 
-    uuid = os.environ.get('UUID', 'b249d7ad-3331-4fc3-b1b4-d412fe0d4414')
-    cf_token = os.environ.get('CF_TOKEN', '')
+    uuid = os.environ.get('UUID') or DEFAULT_UUID
+    cf_token = os.environ.get('CF_TOKEN') or DEFAULT_CF_TOKEN
     nz_server = os.environ.get('NEZHA_SERVER', '')
     nz_port = os.environ.get('NEZHA_PORT', '')
     nz_key = os.environ.get('NEZHA_KEY', '')
 
-    # 1. 启动 Xray 核心 (同时监听 TCP 10000 与 WS 8080)
+    # 1. 启动 Xray 核心 (监听 8080 端口)
     xray_config = {
         "log": {"loglevel": "none"},
-        "inbounds": [
-            {
-                "port": 10000,
-                "listen": "127.0.0.1",
-                "protocol": "vless",
-                "settings": {"clients": [{"id": uuid, "level": 0}], "decryption": "none"},
-                "streamSettings": {"network": "tcp"}
+        "inbounds": [{
+            "port": 8080,
+            "listen": "0.0.0.0",
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": uuid, "level": 0}],
+                "decryption": "none"
             },
-            {
-                "port": 8080,
-                "listen": "0.0.0.0",
-                "protocol": "vless",
-                "settings": {"clients": [{"id": uuid, "level": 0}], "decryption": "none"},
-                "streamSettings": {"network": "ws", "wsSettings": {"path": "/"}}
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": "/"}
             }
-        ],
+        }],
         "outbounds": [{"protocol": "freedom"}]
     }
-    with open("/tmp/xray_config.json", "w") as f:
+    with open("/tmp/xray.json", "w") as f:
         json.dump(xray_config, f)
 
-    subprocess.Popen("/usr/local/bin/xray run -c /tmp/xray_config.json > /tmp/xray.log 2>&1 &", shell=True)
+    subprocess.Popen(
+        "/usr/local/bin/xray run -c /tmp/xray.json > /tmp/xray.log 2>&1",
+        shell=True,
+        start_new_session=True
+    )
 
-    # 2. 启动 Cloudflare 隧道
+    # 2. 启动 Cloudflare 隧道 (直连 8080)
     if cf_token:
-        subprocess.Popen(f"/usr/local/bin/cloudflared tunnel --no-autoupdate run --token {cf_token} > /tmp/cloudflared.log 2>&1 &", shell=True)
+        subprocess.Popen(
+            f"/usr/local/bin/cloudflared tunnel --no-autoupdate run --token {cf_token} > /tmp/cloudflared.log 2>&1",
+            shell=True,
+            start_new_session=True
+        )
 
     # 3. 启动哪吒探针
     if nz_server and nz_key:
         agent_bin = "/tmp/nezha-agent"
         if not os.path.exists(agent_bin):
             os.system(f"curl -sL https://amd64.ssss.nyc.mn/{'agent' if nz_port else 'v1'} -o {agent_bin} && chmod +x {agent_bin}")
+        
         if nz_port:
             tls_flag = '--tls' if str(nz_port) in ['443', '8443', '2096', '2087', '2083', '2053'] else ''
             subprocess.Popen(f"nohup {agent_bin} -s {nz_server}:{nz_port} -p {nz_key} {tls_flag} > /tmp/nezha.log 2>&1 &", shell=True)
@@ -88,93 +98,45 @@ def start_all_services():
                 f.write(cfg)
             subprocess.Popen(f"nohup {agent_bin} -c /tmp/nezha.yaml > /tmp/nezha.log 2>&1 &", shell=True)
 
-# ========== 2. HTTP 与 诊断路由 ==========
+# 容器启动时强制拉起
+launch_background_daemons()
+
+# ========== 3. HTTP 路由 ==========
 @web_app.on_event("startup")
-async def on_startup():
-    start_all_services()
+def on_startup():
+    launch_background_daemons()
 
 @web_app.get("/")
-async def root():
-    start_all_services()
-    return HTMLResponse("<html><body><h2>Cloud Node Operational</h2></body></html>")
+def index():
+    launch_background_daemons()
+    return HTMLResponse("<html><body><h2>Cloud Proxy Node Operational</h2></body></html>")
 
 @web_app.get("/health")
-async def health():
-    start_all_services()
-    return {"status": "ok", "time": time.time()}
+def health():
+    launch_background_daemons()
+    return {"status": "healthy", "time": time.time()}
 
 @web_app.get("/status")
-async def status():
-    start_all_services()
+def status():
+    launch_background_daemons()
     import psutil
     procs = [p.name() for p in psutil.process_iter(['name'])]
-
-    def get_log(path):
-        if os.path.exists(path):
-            with open(path, "r", errors="ignore") as f:
+    
+    def read_log(p):
+        if os.path.exists(p):
+            with open(p, "r", errors="ignore") as f:
                 return f.read()[-500:]
-        return "Not generated"
+        return "Not found"
 
     return {
-        "xray_running": any("xray" in p for p in procs),
-        "cloudflared_running": any("cloudflared" in p for p in procs),
-        "active_processes": procs,
-        "xray_log": get_log("/tmp/xray.log"),
-        "cloudflared_log": get_log("/tmp/cloudflared.log"),
+        "xray_alive": any("xray" in p for p in procs),
+        "cloudflared_alive": any("cloudflared" in p for p in procs),
+        "all_processes": procs,
+        "xray_log": read_log("/tmp/xray.log"),
+        "cloudflared_log": read_log("/tmp/cloudflared.log"),
     }
 
-# ========== 3. WebSocket 直连中继桥 ==========
-@web_app.websocket("/")
-@web_app.websocket("/ws")
-async def websocket_relay(websocket: WebSocket):
-    await websocket.accept()
-    start_all_services()
-
-    reader, writer = None, None
-    for _ in range(15):
-        try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", 10000)
-            break
-        except Exception:
-            await asyncio.sleep(0.2)
-
-    if not writer or not reader:
-        await websocket.close()
-        return
-
-    async def ws_to_tcp():
-        try:
-            while True:
-                data = await websocket.receive_bytes()
-                writer.write(data)
-                await writer.drain()
-        except Exception:
-            pass
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-    async def tcp_to_ws():
-        try:
-            while True:
-                data = await reader.read(4096)
-                if not data:
-                    break
-                await websocket.send_bytes(data)
-        except Exception:
-            pass
-        finally:
-            try:
-                await websocket.close()
-            except Exception:
-                pass
-
-    await asyncio.gather(ws_to_tcp(), tcp_to_ws(), return_exceptions=True)
-
-# ========== 4. Modal 容器入口（保证每次加载都触发启动） ==========
+# ========== 4. Modal 入口 ==========
 @app.function(
     secrets=[modal.Secret.from_name("nezha-secrets")],
     scaledown_window=300,
@@ -182,5 +144,5 @@ async def websocket_relay(websocket: WebSocket):
 )
 @modal.asgi_app()
 def fastapi_app():
-    start_all_services()
+    launch_background_daemons()
     return web_app
