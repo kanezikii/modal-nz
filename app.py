@@ -8,7 +8,7 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 import modal
 
-# ========== 1. 预构建镜像（Xray + Cloudflared） ==========
+# ========== 1. 预构建镜像（固定预装 Xray 与 Cloudflared） ==========
 image = (
     modal.Image.debian_slim()
     .apt_install("curl", "unzip", "ca-certificates", "procps")
@@ -27,15 +27,15 @@ image = (
 app = modal.App("app", image=image)
 web_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
-_init_done = False
-_init_lock = threading.Lock()
+_started = False
+_lock = threading.Lock()
 
-def start_services():
-    global _init_done
-    with _init_lock:
-        if _init_done:
+def start_all_services():
+    global _started
+    with _lock:
+        if _started:
             return
-        _init_done = True
+        _started = True
 
     uuid = os.environ.get('UUID', 'b249d7ad-3331-4fc3-b1b4-d412fe0d4414')
     cf_token = os.environ.get('CF_TOKEN', '')
@@ -43,9 +43,9 @@ def start_services():
     nz_port = os.environ.get('NEZHA_PORT', '')
     nz_key = os.environ.get('NEZHA_KEY', '')
 
-    # 1. 启动 Xray
+    # 1. 启动 Xray 核心 (10000 端口对接直连中继，8080 端口对接 CF 隧道)
     xray_config = {
-        "log": {"loglevel": "warning"},
+        "log": {"loglevel": "none"},
         "inbounds": [
             {
                 "port": 10000,
@@ -64,21 +64,20 @@ def start_services():
         ],
         "outbounds": [{"protocol": "freedom"}]
     }
-    with open("/tmp/xray.json", "w") as f:
+    with open("/tmp/xray_config.json", "w") as f:
         json.dump(xray_config, f)
 
-    subprocess.Popen("/usr/local/bin/xray run -c /tmp/xray.json > /tmp/xray.log 2>&1", shell=True)
+    subprocess.Popen("/usr/local/bin/xray run -c /tmp/xray_config.json > /tmp/xray.log 2>&1 &", shell=True)
 
-    # 2. 启动 Cloudflared 隧道
+    # 2. 启动 Cloudflare 隧道
     if cf_token:
-        subprocess.Popen(f"/usr/local/bin/cloudflared tunnel --no-autoupdate run --token {cf_token} > /tmp/cloudflared.log 2>&1", shell=True)
+        subprocess.Popen(f"/usr/local/bin/cloudflared tunnel --no-autoupdate run --token {cf_token} > /tmp/cloudflared.log 2>&1 &", shell=True)
 
     # 3. 启动哪吒探针
     if nz_server and nz_key:
         agent_bin = "/tmp/nezha-agent"
         if not os.path.exists(agent_bin):
             os.system(f"curl -sL https://amd64.ssss.nyc.mn/{'agent' if nz_port else 'v1'} -o {agent_bin} && chmod +x {agent_bin}")
-        
         if nz_port:
             tls_flag = '--tls' if str(nz_port) in ['443', '8443', '2096', '2087', '2083', '2053'] else ''
             subprocess.Popen(f"nohup {agent_bin} -s {nz_server}:{nz_port} -p {nz_key} {tls_flag} > /tmp/nezha.log 2>&1 &", shell=True)
@@ -90,30 +89,30 @@ def start_services():
             subprocess.Popen(f"nohup {agent_bin} -c /tmp/nezha.yaml > /tmp/nezha.log 2>&1 &", shell=True)
 
 @web_app.on_event("startup")
-def on_startup():
-    start_services()
+async def on_startup():
+    start_all_services()
 
 @web_app.get("/")
-def index():
-    start_services()
+async def root():
+    start_all_services()
     return HTMLResponse("<html><body><h2>Cloud Node Operational</h2></body></html>")
 
 @web_app.get("/health")
-def health():
-    start_services()
+async def health():
+    start_all_services()
     return {"status": "ok", "time": time.time()}
 
-# ========== 状态与日志查看端点 ==========
 @web_app.get("/status")
-def status():
+async def status():
+    start_all_services()
     import psutil
     procs = [p.name() for p in psutil.process_iter(['name'])]
-    
+
     def get_log(path):
         if os.path.exists(path):
             with open(path, "r", errors="ignore") as f:
-                return f.read()[-1000:]
-        return "Log file empty or not generated yet"
+                return f.read()[-600:]
+        return "Not generated"
 
     return {
         "xray_running": any("xray" in p for p in procs),
@@ -123,15 +122,15 @@ def status():
         "cloudflared_log": get_log("/tmp/cloudflared.log"),
     }
 
-# ========== WebSocket 直连中继桥（带等待重试） ==========
+# ========== 2. WebSocket 直连中继桥 ==========
 @web_app.websocket("/")
 @web_app.websocket("/ws")
 async def websocket_relay(websocket: WebSocket):
     await websocket.accept()
-    start_services()
+    start_all_services()
 
     reader, writer = None, None
-    for _ in range(10):
+    for _ in range(15):
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", 10000)
             break
@@ -174,7 +173,7 @@ async def websocket_relay(websocket: WebSocket):
 
     await asyncio.gather(ws_to_tcp(), tcp_to_ws(), return_exceptions=True)
 
-# ========== Modal 入口 ==========
+# ========== 3. Modal 函数入口 ==========
 @app.function(
     secrets=[modal.Secret.from_name("nezha-secrets")],
     scaledown_window=300,
